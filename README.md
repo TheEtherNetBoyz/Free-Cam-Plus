@@ -31,6 +31,13 @@ The package is written to:
 build/mods/secondary_camera.dusk
 ```
 
+## GitHub Actions
+
+The repository includes a GitHub Actions workflow that builds a macOS arm64
+package automatically on pushes, pull requests, or manual workflow runs. The
+finished `secondary_camera.dusk` file is available from the workflow's
+**Freecam-plus-macos-arm64** artifact.
+
 For a full-tree build, add:
 
 ```sh
