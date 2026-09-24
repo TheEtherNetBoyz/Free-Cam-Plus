@@ -64,3 +64,47 @@ jobs:
           path: build/mods/secondary_camera.dusk
           if-no-files-found: error
           retention-days: 14
+
+  build-windows-x86_64:
+    name: Build Windows x86-64 package
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out Freecam+
+        uses: actions/checkout@v4
+
+      - name: Check out Dusklight
+        uses: actions/checkout@v4
+        with:
+          repository: TheEtherNetBoyz/EtherNet-MFB
+          ref: main
+          path: dusklight
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Enable Visual Studio environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja --no-progress --yes
+
+      - name: Configure Freecam+
+        shell: pwsh
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          "-DDUSK_DIR=$env:GITHUB_WORKSPACE/dusklight"
+
+      - name: Build Freecam+ package
+        run: cmake --build build --target secondary_camera_package --parallel 4
+
+      - name: Upload Freecam+ package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Freecam-plus-windows-x86_64
+          path: build/mods/secondary_camera.dusk
+          if-no-files-found: error
+          retention-days: 14
