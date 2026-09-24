@@ -39,6 +39,10 @@ workflow runs. The finished `secondary_camera.dusk` files are available from
 the workflow's **Freecam-plus-macos-arm64** and
 **Freecam-plus-windows-x86_64** artifacts.
 
+The workflow pins its Dusklight dependency to a compatible revision because
+Freecam+ uses the WindowService keyboard, mouse, and window-management APIs
+provided by that revision.
+
 For a full-tree build, add:
 
 ```sh
