@@ -22,6 +22,13 @@
 #include <cstring>
 #include <webgpu/webgpu.h>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 DEFINE_MOD();
 IMPORT_SERVICE(ConfigService, svc_config);
 IMPORT_SERVICE(GfxService, svc_gfx);
@@ -113,6 +120,12 @@ bool windowServiceSupports(uint16_t minor, size_t memberEnd) {
         service->header.struct_size >= memberEnd;
 }
 
+bool windowServiceHasInputEvents() {
+    return windowServiceSupports(kWindowInputMinor,
+        offsetof(WindowServiceCompatibilityView, set_relative_mouse_mode) +
+            sizeof(WindowSetRelativeMouseModeFn));
+}
+
 // SDL scancodes use the USB HID keyboard-page values. Keeping the handful used here local lets
 // this mod consume WindowService input without depending on SDL headers or linking SDL itself.
 constexpr int32_t kScancodeA = 4;
@@ -153,6 +166,10 @@ bool g_windowFocused = false;
 bool g_mouseCaptured = false;
 bool g_windowAlwaysOnTopApplied = false;
 bool g_hasRenderedFrame = false;
+#if defined(_WIN32)
+bool g_windowsCursorCaptured = false;
+bool g_windowsEscapeDown = false;
+#endif
 uint32_t g_stablePlayerModelFrames = 0;
 using CameraClock = std::chrono::steady_clock;
 CameraClock::time_point g_nextCameraRender;
@@ -793,6 +810,10 @@ ModResult closeWindow() {
     g_windowFocused = false;
     g_windowAlwaysOnTopApplied = false;
     g_hasRenderedFrame = false;
+#if defined(_WIN32)
+    g_windowsCursorCaptured = false;
+    g_windowsEscapeDown = false;
+#endif
     g_nextCameraRender = CameraClock::time_point{};
     g_input = {};
     return MOD_OK;
@@ -844,9 +865,7 @@ void onWindowEvent(ModContext*, WindowHandle, const WindowEvent* event, void*) {
         g_windowFocused = false;
         g_input = {};
 
-    } else if (windowServiceSupports(kWindowInputMinor,
-                   offsetof(WindowServiceCompatibilityView, set_relative_mouse_mode) +
-                       sizeof(WindowSetRelativeMouseModeFn)) &&
+    } else if (windowServiceHasInputEvents() &&
                event->struct_size >= offsetof(WindowEventCompatibilityView, keycode) +
                    sizeof(int32_t)) {
         const auto* inputEvent = reinterpret_cast<const WindowEventCompatibilityView*>(event);
@@ -872,6 +891,68 @@ void onWindowEvent(ModContext*, WindowHandle, const WindowEvent* event, void*) {
     }
 }
 
+#if defined(_WIN32)
+bool windowsKeyDown(int virtualKey) {
+    return (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+}
+
+void pollWindowsInput() {
+    if (windowServiceHasInputEvents() || g_window == 0 || !g_windowFocused ||
+        !g_mouseCaptured || !getControlsEnabled()) {
+        g_windowsCursorCaptured = false;
+        g_windowsEscapeDown = false;
+        return;
+    }
+
+    const bool escapeDown = windowsKeyDown(VK_ESCAPE);
+    if (escapeDown && !g_windowsEscapeDown) {
+        svc_config->set_bool(mod_ctx, g_controls, false);
+        g_input = {};
+    }
+    g_windowsEscapeDown = escapeDown;
+    if (!getControlsEnabled()) {
+        g_windowsCursorCaptured = false;
+        return;
+    }
+
+    setKeyState(kScancodeW, windowsKeyDown('W'));
+    setKeyState(kScancodeA, windowsKeyDown('A'));
+    setKeyState(kScancodeS, windowsKeyDown('S'));
+    setKeyState(kScancodeD, windowsKeyDown('D'));
+    setKeyState(kScancodeSpace, windowsKeyDown(VK_SPACE));
+    setKeyState(kScancodeLeftCtrl, windowsKeyDown(VK_LCONTROL));
+    setKeyState(kScancodeLeftShift, windowsKeyDown(VK_LSHIFT));
+
+    WindowInfo info = WINDOW_INFO_INIT;
+    if (svc_window->get_info(mod_ctx, g_window, &info) != MOD_OK || info.width == 0 ||
+        info.height == 0) {
+        g_windowsCursorCaptured = false;
+        return;
+    }
+
+    POINT center{
+        static_cast<LONG>(info.x + static_cast<int32_t>(info.width / 2)),
+        static_cast<LONG>(info.y + static_cast<int32_t>(info.height / 2)),
+    };
+    if (!g_windowsCursorCaptured) {
+        SetCursorPos(center.x, center.y);
+        g_windowsCursorCaptured = true;
+        return;
+    }
+
+    POINT cursor{};
+    if (GetCursorPos(&cursor)) {
+        g_input.mouseDeltaX += static_cast<float>(cursor.x - center.x);
+        g_input.mouseDeltaY += static_cast<float>(cursor.y - center.y);
+        if (cursor.x != center.x || cursor.y != center.y) {
+            SetCursorPos(center.x, center.y);
+        }
+    }
+}
+#else
+void pollWindowsInput() {}
+#endif
+
 void syncMouseCapture() {
     if (g_window == 0) {
         g_mouseCaptured = false;
@@ -879,13 +960,17 @@ void syncMouseCapture() {
     }
 
     const auto* service = windowServiceCompatibility();
-    if (!windowServiceSupports(kWindowInputMinor,
-            offsetof(WindowServiceCompatibilityView, set_relative_mouse_mode) +
-                sizeof(WindowSetRelativeMouseModeFn)) ||
-        service->set_relative_mouse_mode == nullptr) {
+#if defined(_WIN32)
+    if (!windowServiceHasInputEvents() || service->set_relative_mouse_mode == nullptr) {
+        g_mouseCaptured = g_windowFocused && getControlsEnabled();
+        return;
+    }
+#else
+    if (!windowServiceHasInputEvents() || service->set_relative_mouse_mode == nullptr) {
         g_mouseCaptured = false;
         return;
     }
+#endif
 
     const bool wanted = g_windowFocused && getControlsEnabled();
     if (wanted == g_mouseCaptured) {
@@ -1220,6 +1305,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 MOD_EXPORT ModResult mod_update(ModError*) {
     syncAlwaysOnTop();
     syncMouseCapture();
+    pollWindowsInput();
     updateControls(1.0f / 60.0f);
     return MOD_OK;
 }

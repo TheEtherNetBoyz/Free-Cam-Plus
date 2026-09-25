@@ -22,3 +22,7 @@ add_mod(secondary_camera
     MOD_JSON mod.json
     BUNDLE
 )
+
+if(WIN32)
+    target_link_libraries(secondary_camera PRIVATE user32)
+endif()

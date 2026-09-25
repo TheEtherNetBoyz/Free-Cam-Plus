@@ -41,8 +41,9 @@ the workflow's **Freecam-plus-macos-arm64** and
 
 The workflow builds against the current Dusklight `main` branch. Newer
 WindowService input and always-on-top functions are detected at runtime, so
-the package uses enhanced controls on newer compatible hosts while retaining
-the base window functionality on older hosts.
+the package uses enhanced controls on hosts that expose them. On Windows hosts
+that still publish WindowService 1.0, Freecam+ falls back to native keyboard
+polling and cursor recentering for the auxiliary window.
 
 For a full-tree build, add:
 
