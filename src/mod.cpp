@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <webgpu/webgpu.h>
 
@@ -55,9 +56,6 @@ constexpr const char* kUpdateRateOptions[] = {
     "20 FPS",
     "15 FPS",
 };
-constexpr float kShoulderFollowResponse = 120.0f;
-constexpr float kShoulderFollowPrediction = 0.5f;
-constexpr float kShoulderFollowMaxPredictionSpeed = 240.0f;
 
 // WindowService is append-only, but the latest Dusklight main branch still publishes the
 // 1.0 header while newer hosts append input and always-on-top functions. Keep the compatibility
@@ -174,6 +172,8 @@ bool g_windowFocused = false;
 bool g_mouseCaptured = false;
 bool g_windowAlwaysOnTopApplied = false;
 bool g_hasRenderedFrame = false;
+bool g_closeWindowRequested = false;
+bool g_windowClosing = false;
 #if defined(_WIN32)
 bool g_windowsCursorCaptured = false;
 bool g_windowsEscapeDown = false;
@@ -183,8 +183,6 @@ using CameraClock = std::chrono::steady_clock;
 CameraClock::time_point g_nextCameraRender;
 bool g_bootWindowPending = false;
 bool g_bootWindowAttempted = false;
-CameraClock::time_point g_lastShoulderFollowUpdate;
-bool g_shoulderFollowInitialized = false;
 
 struct InputState {
     bool forward = false;
@@ -211,6 +209,21 @@ struct CameraState {
 };
 
 CameraState g_camera;
+
+struct PlayerFollowSnapshot {
+    bool valid = false;
+    const daAlink_c* player = nullptr;
+    cXyz previousPosition;
+    cXyz currentPosition;
+    s16 previousAngle = 0;
+    s16 currentAngle = 0;
+    uint64_t simulationTick = 0;
+};
+
+PlayerFollowSnapshot g_playerFollow;
+float g_presentationStep = 1.0f;
+uint64_t g_presentationSimulationTick = 0;
+bool g_hasPresentationSimulationTick = false;
 
 bool canRefreshPlayerModelsForCurrentView(const daAlink_c* player) {
     if (player == nullptr) {
@@ -374,50 +387,57 @@ void updateShoulderCamera(const daAlink_c* player) {
         return;
     }
 
+    const cXyz rawPosition = player->current.pos;
+    const s16 rawAngle = player->shape_angle.y;
+    if (!g_playerFollow.valid || g_playerFollow.player != player) {
+        g_playerFollow.player = player;
+        g_playerFollow.previousPosition = rawPosition;
+        g_playerFollow.currentPosition = rawPosition;
+        g_playerFollow.previousAngle = rawAngle;
+        g_playerFollow.currentAngle = rawAngle;
+        g_playerFollow.simulationTick = g_presentationSimulationTick;
+        g_playerFollow.valid = true;
+    } else if ((g_hasPresentationSimulationTick &&
+                   g_presentationSimulationTick != g_playerFollow.simulationTick) ||
+               (!g_hasPresentationSimulationTick &&
+                   (rawPosition.x != g_playerFollow.currentPosition.x ||
+                    rawPosition.y != g_playerFollow.currentPosition.y ||
+                    rawPosition.z != g_playerFollow.currentPosition.z ||
+                    rawAngle != g_playerFollow.currentAngle))) {
+        g_playerFollow.previousPosition = g_playerFollow.currentPosition;
+        g_playerFollow.currentPosition = rawPosition;
+        g_playerFollow.previousAngle = g_playerFollow.currentAngle;
+        g_playerFollow.currentAngle = rawAngle;
+        g_playerFollow.simulationTick = g_presentationSimulationTick;
+    }
+
+    // Dusklight renders Link between simulation snapshots on presentation
+    // frames. Follow the same point in time; using player->current directly
+    // makes the camera advance at 30 Hz while Link's model advances smoothly.
+    const float step = g_presentationStep;
+    const cXyz anchor = g_playerFollow.previousPosition +
+        (g_playerFollow.currentPosition - g_playerFollow.previousPosition) * step;
+    const s16 angleDelta = static_cast<s16>(
+        static_cast<u16>(g_playerFollow.currentAngle) -
+        static_cast<u16>(g_playerFollow.previousAngle));
+    const float presentedAngle = static_cast<float>(g_playerFollow.previousAngle) +
+        static_cast<float>(angleDelta) * step;
+
     // Twilight uses sin(angle) for X and cos(angle) for Z. Zero orbit angle is
     // directly behind Link; the configurable angle orbits around him.
     constexpr float kGameAngleToRadians = 3.14159265358979323846f / 32768.0f;
     constexpr float kDegreesToRadians = 3.14159265358979323846f / 180.0f;
-    const float orbitAngle = static_cast<float>(player->shape_angle.y) *
-            kGameAngleToRadians + getShoulderAngle() * kDegreesToRadians;
+    const float orbitAngle = presentedAngle * kGameAngleToRadians +
+        getShoulderAngle() * kDegreesToRadians;
     const cXyz forward(std::sin(orbitAngle), 0.0f, std::cos(orbitAngle));
     const cXyz right(std::cos(orbitAngle), 0.0f, -std::sin(orbitAngle));
-    const cXyz anchor = player->current.pos;
-    const cXyz velocity = player->current.pos - player->old.pos;
-    const float velocityLength = std::sqrt(
-        velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z);
-    const cXyz followAnchor = velocityLength <= kShoulderFollowMaxPredictionSpeed
-        ? anchor + velocity * kShoulderFollowPrediction
-        : anchor;
 
-    const cXyz targetEye = followAnchor - (forward * getShoulderDistance()) +
+    g_camera.eye = anchor - (forward * getShoulderDistance()) +
         (right * getShoulderSideOffset()) + cXyz(0.0f, getShoulderHeight(), 0.0f);
-    const cXyz targetCenter = followAnchor + cXyz(0.0f, getShoulderAimHeight(), 0.0f);
-    const CameraClock::time_point now = CameraClock::now();
-    const float elapsed = g_lastShoulderFollowUpdate.time_since_epoch().count() == 0
-        ? 0.0f
-        : std::chrono::duration<float>(now - g_lastShoulderFollowUpdate).count();
-    const bool snap = !g_shoulderFollowInitialized || elapsed <= 0.0f || elapsed > 0.25f;
-    if (snap) {
-        g_camera.eye = targetEye;
-        g_camera.center = targetCenter;
-    } else {
-        const float alpha = 1.0f - std::exp(-kShoulderFollowResponse *
-            std::min(elapsed, 0.1f));
-        g_camera.eye.x += (targetEye.x - g_camera.eye.x) * alpha;
-        g_camera.eye.y += (targetEye.y - g_camera.eye.y) * alpha;
-        g_camera.eye.z += (targetEye.z - g_camera.eye.z) * alpha;
-        g_camera.center.x += (targetCenter.x - g_camera.center.x) * alpha;
-        g_camera.center.y += (targetCenter.y - g_camera.center.y) * alpha;
-        g_camera.center.z += (targetCenter.z - g_camera.center.z) * alpha;
-    }
-    g_lastShoulderFollowUpdate = now;
-    g_shoulderFollowInitialized = true;
+    g_camera.center = anchor + cXyz(0.0f, getShoulderAimHeight(), 0.0f);
     g_camera.fovy = getFov();
     g_camera.bank = 0;
     g_camera.initialized = true;
-    g_lastShoulderFollowUpdate = CameraClock::time_point{};
-    g_shoulderFollowInitialized = false;
     updateAngles();
 }
 
@@ -623,9 +643,6 @@ void renderCamera2() {
     daAlink_c* player = daAlink_getAlinkActorClass();
     if (getShoulderFollow()) {
         updateShoulderCamera(player);
-    } else {
-        g_lastShoulderFollowUpdate = CameraClock::time_point{};
-        g_shoulderFollowInitialized = false;
     }
 
     Mtx cameraView;
@@ -709,6 +726,10 @@ void renderCamera2() {
 }
 
 void releasePresentPipeline() {
+    if (g_bloomParamsBuffer != nullptr) {
+        wgpuBufferRelease(g_bloomParamsBuffer);
+        g_bloomParamsBuffer = nullptr;
+    }
     if (g_presentPipeline != nullptr) {
         wgpuRenderPipelineRelease(g_presentPipeline);
         g_presentPipeline = nullptr;
@@ -716,10 +737,6 @@ void releasePresentPipeline() {
     if (g_presentLayout != nullptr) {
         wgpuBindGroupLayoutRelease(g_presentLayout);
         g_presentLayout = nullptr;
-    }
-    if (g_bloomParamsBuffer != nullptr) {
-        wgpuBufferRelease(g_bloomParamsBuffer);
-        g_bloomParamsBuffer = nullptr;
     }
     g_presentFormat = WGPUTextureFormat_Undefined;
 }
@@ -806,8 +823,7 @@ void onPresent(ModContext*, const GfxPresentContext* ctx, const void* payload,
                     static_cast<float>(blendColor.a) / 255.0f,
                 },
             };
-            wgpuQueueWriteBuffer(ctx->queue, g_bloomParamsBuffer, 0, &params,
-                sizeof(params));
+            wgpuQueueWriteBuffer(ctx->queue, g_bloomParamsBuffer, 0, &params, sizeof(params));
 
             WGPUBindGroupEntry entries[2] = {
                 WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
@@ -847,6 +863,14 @@ void onPresent(ModContext*, const GfxPresentContext* ctx, const void* payload,
 void saveWindowPosition();
 
 ModResult closeWindow() {
+    if (g_window == 0 && g_presentTarget == 0) {
+        g_closeWindowRequested = false;
+        return MOD_OK;
+    }
+    if (g_windowClosing) {
+        return MOD_CONFLICT;
+    }
+    g_windowClosing = true;
     saveWindowPosition();
     if (g_window != 0 && g_mouseCaptured) {
         const auto* service = windowServiceCompatibility();
@@ -861,6 +885,7 @@ ModResult closeWindow() {
     if (g_presentTarget != 0) {
         const ModResult result = svc_gfx->unregister_present_target(mod_ctx, g_presentTarget);
         if (result != MOD_OK) {
+            g_windowClosing = false;
             return result;
         }
         g_presentTarget = 0;
@@ -868,6 +893,7 @@ ModResult closeWindow() {
     if (g_window != 0) {
         const ModResult result = svc_window->destroy_window(mod_ctx, g_window);
         if (result != MOD_OK) {
+            g_windowClosing = false;
             return result;
         }
         g_window = 0;
@@ -881,6 +907,8 @@ ModResult closeWindow() {
 #endif
     g_nextCameraRender = CameraClock::time_point{};
     g_input = {};
+    g_closeWindowRequested = false;
+    g_windowClosing = false;
     return MOD_OK;
 }
 
@@ -923,7 +951,13 @@ void onWindowEvent(ModContext*, WindowHandle, const WindowEvent* event, void*) {
     }
 
     if (event->type == WINDOW_EVENT_CLOSE_REQUESTED) {
-        closeWindow();
+        // Do not unregister the graphics target from inside SDL's event dispatch. The
+        // graphics service synchronizes its worker there, which can deadlock while the
+        // host is closing or while the auxiliary surface is being torn down.
+        g_closeWindowRequested = true;
+        return;
+    } else if (event->type == WINDOW_EVENT_MOVED) {
+        saveWindowPosition();
     } else if (event->type == WINDOW_EVENT_FOCUS_GAINED) {
         activateFreeCameraControls();
     } else if (event->type == WINDOW_EVENT_FOCUS_LOST) {
@@ -1196,7 +1230,19 @@ void onSceneBegin(ModContext*, const GfxStageContext* stageCtx, void*) {
     }
 }
 
-void onFrameBeforeHud(ModContext*, const GfxStageContext*, void*) {
+void onFrameBeforeHud(ModContext*, const GfxStageContext* stageCtx, void*) {
+    constexpr size_t kInterpolationStepEnd =
+        offsetof(GfxStageContext, interpolation_step) + sizeof(float);
+    g_presentationStep = stageCtx != nullptr && stageCtx->struct_size >= kInterpolationStepEnd
+        ? std::clamp(stageCtx->interpolation_step, 0.0f, 1.0f)
+        : 1.0f;
+    constexpr size_t kSimulationTickEnd =
+        offsetof(GfxStageContext, simulation_tick) + sizeof(uint64_t);
+    g_hasPresentationSimulationTick =
+        stageCtx != nullptr && stageCtx->struct_size >= kSimulationTickEnd;
+    if (g_hasPresentationSimulationTick) {
+        g_presentationSimulationTick = stageCtx->simulation_tick;
+    }
     renderCamera2();
 }
 
@@ -1455,7 +1501,12 @@ MOD_EXPORT ModResult mod_update(ModError*) {
             svc_log->error(mod_ctx, "failed to start Freecam+ automatically on boot");
         }
     }
-    saveWindowPosition();
+    if (g_closeWindowRequested && !g_windowClosing) {
+        const ModResult result = closeWindow();
+        if (result != MOD_OK) {
+            svc_log->error(mod_ctx, "failed to close Freecam+ window after close request");
+        }
+    }
     syncAlwaysOnTop();
     syncMouseCapture();
     pollWindowsInput();
@@ -1464,6 +1515,7 @@ MOD_EXPORT ModResult mod_update(ModError*) {
 }
 
 MOD_EXPORT ModResult mod_shutdown(ModError*) {
+    g_closeWindowRequested = false;
     if (g_menuTab != 0) {
         svc_ui->unregister_menu_tab(mod_ctx, g_menuTab);
         g_menuTab = 0;
@@ -1484,7 +1536,17 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         svc_gfx->unregister_stage_hook(mod_ctx, g_frameBeforeHudHook);
         g_frameBeforeHudHook = 0;
     }
-    closeWindow();
+    // Dusklight's deactivation sequence has already synchronized and detached the
+    // graphics task before calling mod_shutdown, then removes this mod's windows and
+    // present targets immediately afterward. Do not unregister the same target again
+    // here; doing so can wait forever during host shutdown. Save the position while
+    // the window handle is still valid and let the services own final teardown.
+    saveWindowPosition();
+    g_presentTarget = 0;
+    g_window = 0;
+    g_mouseCaptured = false;
+    g_windowFocused = false;
+    g_windowClosing = false;
     releasePresentPipeline();
     g_controls = g_moveSpeed = g_fov = g_updateRate = g_alwaysOnTop = 0;
     g_shoulderFollow = g_shoulderDistance = g_shoulderSideOffset = 0;
