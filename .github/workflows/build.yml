@@ -22,8 +22,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: TheEtherNetBoyz/EtherNet-MFB
-          # Freecam+ uses the WindowService input APIs introduced on this revision.
-          ref: 2c522109906b159a18aa9c71d7704ba8e8dc32be
+          # Build against the current host. Newer WindowService fields are detected at runtime.
+          ref: main
           path: dusklight
           fetch-depth: 1
           submodules: recursive
@@ -81,8 +81,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: TheEtherNetBoyz/EtherNet-MFB
-          # Freecam+ uses the WindowService input APIs introduced on this revision.
-          ref: 2c522109906b159a18aa9c71d7704ba8e8dc32be
+          # Build against the current host. Newer WindowService fields are detected at runtime.
+          ref: main
           path: dusklight
           fetch-depth: 1
           submodules: recursive

@@ -47,6 +47,72 @@ constexpr const char* kUpdateRateOptions[] = {
     "15 FPS",
 };
 
+// WindowService is append-only, but the latest Dusklight main branch still publishes the
+// 1.0 header while newer hosts append input and always-on-top functions. Keep the compatibility
+// view local so this package can be compiled against 1.0 and take advantage of newer hosts at
+// runtime without importing newer fields from an older SDK header.
+using WindowCreateFn = decltype(((WindowService*)nullptr)->create_window);
+using WindowDestroyFn = decltype(((WindowService*)nullptr)->destroy_window);
+using WindowShowFn = decltype(((WindowService*)nullptr)->show_window);
+using WindowHideFn = decltype(((WindowService*)nullptr)->hide_window);
+using WindowSetTitleFn = decltype(((WindowService*)nullptr)->set_title);
+using WindowSetSizeFn = decltype(((WindowService*)nullptr)->set_size);
+using WindowGetInfoFn = decltype(((WindowService*)nullptr)->get_info);
+using WindowSetRelativeMouseModeFn = ModResult (*)(
+    ModContext* ctx, WindowHandle window, bool enabled);
+using WindowSetAlwaysOnTopFn = ModResult (*)(
+    ModContext* ctx, WindowHandle window, bool enabled);
+
+struct WindowServiceCompatibilityView {
+    ServiceHeader header;
+    WindowCreateFn create_window;
+    WindowDestroyFn destroy_window;
+    WindowShowFn show_window;
+    WindowHideFn hide_window;
+    WindowSetTitleFn set_title;
+    WindowSetSizeFn set_size;
+    WindowGetInfoFn get_info;
+    WindowSetRelativeMouseModeFn set_relative_mouse_mode;
+    WindowSetAlwaysOnTopFn set_always_on_top;
+};
+
+struct WindowEventCompatibilityView {
+    uint32_t struct_size;
+    WindowEventType type;
+    int32_t x;
+    int32_t y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t pixel_width;
+    uint32_t pixel_height;
+    float display_scale;
+    int32_t keycode;
+    int32_t scancode;
+    uint32_t mouse_button;
+    float mouse_x;
+    float mouse_y;
+    float mouse_delta_x;
+    float mouse_delta_y;
+    bool repeat;
+};
+
+constexpr uint16_t kWindowInputMinor = 1;
+constexpr uint16_t kWindowAlwaysOnTopMinor = 2;
+constexpr auto kWindowEventKeyDown = static_cast<WindowEventType>(7);
+constexpr auto kWindowEventKeyUp = static_cast<WindowEventType>(8);
+constexpr auto kWindowEventMouseMotion = static_cast<WindowEventType>(9);
+constexpr auto kWindowEventMouseButtonDown = static_cast<WindowEventType>(10);
+
+const WindowServiceCompatibilityView* windowServiceCompatibility() {
+    return reinterpret_cast<const WindowServiceCompatibilityView*>(svc_window);
+}
+
+bool windowServiceSupports(uint16_t minor, size_t memberEnd) {
+    const auto* service = windowServiceCompatibility();
+    return service != nullptr && service->header.minor_version >= minor &&
+        service->header.struct_size >= memberEnd;
+}
+
 // SDL scancodes use the USB HID keyboard-page values. Keeping the handful used here local lets
 // this mod consume WindowService input without depending on SDL headers or linking SDL itself.
 constexpr int32_t kScancodeA = 4;
@@ -645,7 +711,7 @@ void onPresent(ModContext*, const GfxPresentContext* ctx, const void* payload,
             const float threshold = std::clamp(
                 static_cast<float>(nativeBloom->getPoint()) / 255.0f, 0.08f, 0.45f);
             const float density = static_cast<float>(nativeBloom->getBlureRatio()) / 255.0f;
-            const bool twilightVisuals = dKy_darkworld_visual_effect_check() != 0;
+            const bool twilightVisuals = dKy_darkworld_check() != 0;
             const float strengthScale = twilightVisuals ? 1.0f : kAreaBloomStrengthScale;
             const float strength = nativeBloom->getEnable() != 0
                 ? (0.9f + density * 3.6f) * strengthScale
@@ -701,7 +767,13 @@ void onPresent(ModContext*, const GfxPresentContext* ctx, const void* payload,
 
 ModResult closeWindow() {
     if (g_window != 0 && g_mouseCaptured) {
-        svc_window->set_relative_mouse_mode(mod_ctx, g_window, false);
+        const auto* service = windowServiceCompatibility();
+        if (windowServiceSupports(kWindowInputMinor,
+                offsetof(WindowServiceCompatibilityView, set_relative_mouse_mode) +
+                    sizeof(WindowSetRelativeMouseModeFn)) &&
+            service->set_relative_mouse_mode != nullptr) {
+            service->set_relative_mouse_mode(mod_ctx, g_window, false);
+        }
         g_mouseCaptured = false;
     }
     if (g_presentTarget != 0) {
@@ -760,6 +832,10 @@ void activateFreeCameraControls() {
 }
 
 void onWindowEvent(ModContext*, WindowHandle, const WindowEvent* event, void*) {
+    if (event == nullptr) {
+        return;
+    }
+
     if (event->type == WINDOW_EVENT_CLOSE_REQUESTED) {
         closeWindow();
     } else if (event->type == WINDOW_EVENT_FOCUS_GAINED) {
@@ -767,22 +843,32 @@ void onWindowEvent(ModContext*, WindowHandle, const WindowEvent* event, void*) {
     } else if (event->type == WINDOW_EVENT_FOCUS_LOST) {
         g_windowFocused = false;
         g_input = {};
-    } else if (event->type == WINDOW_EVENT_KEY_DOWN) {
-        if (event->scancode == kScancodeEscape) {
-            svc_config->set_bool(mod_ctx, g_controls, false);
-            g_input = {};
-        } else {
-            setKeyState(event->scancode, true);
+
+    } else if (windowServiceSupports(kWindowInputMinor,
+                   offsetof(WindowServiceCompatibilityView, set_relative_mouse_mode) +
+                       sizeof(WindowSetRelativeMouseModeFn)) &&
+               event->struct_size >= offsetof(WindowEventCompatibilityView, keycode) +
+                   sizeof(int32_t)) {
+        const auto* inputEvent = reinterpret_cast<const WindowEventCompatibilityView*>(event);
+        if (inputEvent->type == kWindowEventKeyDown) {
+            if (inputEvent->scancode == kScancodeEscape) {
+                svc_config->set_bool(mod_ctx, g_controls, false);
+                g_input = {};
+            } else {
+                setKeyState(inputEvent->scancode, true);
+            }
+        } else if (inputEvent->type == kWindowEventKeyUp) {
+            setKeyState(inputEvent->scancode, false);
+        } else if (inputEvent->type == kWindowEventMouseButtonDown) {
+            // A click should recapture controls even if Escape released them while this
+            // window remained focused (which does not generate another focus event).
+            activateFreeCameraControls();
+        } else if (inputEvent->type == kWindowEventMouseMotion && g_mouseCaptured &&
+                   event->struct_size >= offsetof(WindowEventCompatibilityView, repeat) +
+                       sizeof(bool)) {
+            g_input.mouseDeltaX += inputEvent->mouse_delta_x;
+            g_input.mouseDeltaY += inputEvent->mouse_delta_y;
         }
-    } else if (event->type == WINDOW_EVENT_KEY_UP) {
-        setKeyState(event->scancode, false);
-    } else if (event->type == WINDOW_EVENT_MOUSE_BUTTON_DOWN) {
-        // A click should recapture controls even if Escape released them while this
-        // window remained focused (which does not generate another focus event).
-        activateFreeCameraControls();
-    } else if (event->type == WINDOW_EVENT_MOUSE_MOTION && g_mouseCaptured) {
-        g_input.mouseDeltaX += event->mouse_delta_x;
-        g_input.mouseDeltaY += event->mouse_delta_y;
     }
 }
 
@@ -791,11 +877,21 @@ void syncMouseCapture() {
         g_mouseCaptured = false;
         return;
     }
+
+    const auto* service = windowServiceCompatibility();
+    if (!windowServiceSupports(kWindowInputMinor,
+            offsetof(WindowServiceCompatibilityView, set_relative_mouse_mode) +
+                sizeof(WindowSetRelativeMouseModeFn)) ||
+        service->set_relative_mouse_mode == nullptr) {
+        g_mouseCaptured = false;
+        return;
+    }
+
     const bool wanted = g_windowFocused && getControlsEnabled();
     if (wanted == g_mouseCaptured) {
         return;
     }
-    if (svc_window->set_relative_mouse_mode(mod_ctx, g_window, wanted) == MOD_OK) {
+    if (service->set_relative_mouse_mode(mod_ctx, g_window, wanted) == MOD_OK) {
         g_mouseCaptured = wanted;
     }
 }
@@ -805,13 +901,21 @@ void syncAlwaysOnTop() {
         return;
     }
 
+    const auto* service = windowServiceCompatibility();
+    if (!windowServiceSupports(kWindowAlwaysOnTopMinor,
+            offsetof(WindowServiceCompatibilityView, set_always_on_top) +
+                sizeof(WindowSetAlwaysOnTopFn)) ||
+        service->set_always_on_top == nullptr) {
+        return;
+    }
+
     bool wanted = false;
     svc_config->get_bool(mod_ctx, g_alwaysOnTop, &wanted);
     if (wanted == g_windowAlwaysOnTopApplied) {
         return;
     }
 
-    if (svc_window->set_always_on_top(mod_ctx, g_window, wanted) == MOD_OK) {
+    if (service->set_always_on_top(mod_ctx, g_window, wanted) == MOD_OK) {
         g_windowAlwaysOnTopApplied = wanted;
     }
 }

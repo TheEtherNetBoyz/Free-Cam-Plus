@@ -39,9 +39,10 @@ workflow runs. The finished `secondary_camera.dusk` files are available from
 the workflow's **Freecam-plus-macos-arm64** and
 **Freecam-plus-windows-x86_64** artifacts.
 
-The workflow pins its Dusklight dependency to a compatible revision because
-Freecam+ uses the WindowService keyboard, mouse, and window-management APIs
-provided by that revision.
+The workflow builds against the current Dusklight `main` branch. Newer
+WindowService input and always-on-top functions are detected at runtime, so
+the package uses enhanced controls on newer compatible hosts while retaining
+the base window functionality on older hosts.
 
 For a full-tree build, add:
 
@@ -64,5 +65,6 @@ numeric controls are inside **Open Over-the-Shoulder Settings**.
 ## Standalone compatibility
 
 The mod is built against Dusklight's public game/mod interfaces. Use a
-Dusklight checkout with a compatible game ABI and build the package for the
-target platform and architecture.
+Dusklight checkout with the compatible GameService ABI (major 2) and build the
+package for the target platform and architecture. Pre-ABI-2 releases are not
+supported.
