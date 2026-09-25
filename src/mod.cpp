@@ -106,12 +106,28 @@ struct WindowEventCompatibilityView {
     bool repeat;
 };
 
+// GfxStageContext is append-only. The standalone repository intentionally
+// builds against its pinned SDK, which may predate presentation timing fields,
+// while newer Dusklight hosts append them at runtime. Keep the extended layout
+// local so both old-SDK CI builds and new hosts are supported.
+struct GfxStageContextInterpolationView {
+    uint32_t struct_size;
+    GfxStage stage;
+    const void* game_view;
+    const void* game_viewport;
+    float interpolation_step;
+    uint64_t simulation_tick;
+};
+
 constexpr uint16_t kWindowInputMinor = 1;
 constexpr uint16_t kWindowAlwaysOnTopMinor = 2;
-constexpr auto kWindowEventKeyDown = static_cast<WindowEventType>(7);
-constexpr auto kWindowEventKeyUp = static_cast<WindowEventType>(8);
-constexpr auto kWindowEventMouseMotion = static_cast<WindowEventType>(9);
-constexpr auto kWindowEventMouseButtonDown = static_cast<WindowEventType>(10);
+// Keep appended event kinds as integers. Apple Clang rejects constexpr casts
+// to enum values not declared by the pinned older SDK, even though newer hosts
+// legitimately append those values at runtime.
+constexpr uint32_t kWindowEventKeyDown = 7;
+constexpr uint32_t kWindowEventKeyUp = 8;
+constexpr uint32_t kWindowEventMouseMotion = 9;
+constexpr uint32_t kWindowEventMouseButtonDown = 10;
 
 const WindowServiceCompatibilityView* windowServiceCompatibility() {
     return reinterpret_cast<const WindowServiceCompatibilityView*>(svc_window);
@@ -968,20 +984,21 @@ void onWindowEvent(ModContext*, WindowHandle, const WindowEvent* event, void*) {
                event->struct_size >= offsetof(WindowEventCompatibilityView, keycode) +
                    sizeof(int32_t)) {
         const auto* inputEvent = reinterpret_cast<const WindowEventCompatibilityView*>(event);
-        if (inputEvent->type == kWindowEventKeyDown) {
+        const uint32_t eventType = static_cast<uint32_t>(inputEvent->type);
+        if (eventType == kWindowEventKeyDown) {
             if (inputEvent->scancode == kScancodeEscape) {
                 svc_config->set_bool(mod_ctx, g_controls, false);
                 g_input = {};
             } else {
                 setKeyState(inputEvent->scancode, true);
             }
-        } else if (inputEvent->type == kWindowEventKeyUp) {
+        } else if (eventType == kWindowEventKeyUp) {
             setKeyState(inputEvent->scancode, false);
-        } else if (inputEvent->type == kWindowEventMouseButtonDown) {
+        } else if (eventType == kWindowEventMouseButtonDown) {
             // A click should recapture controls even if Escape released them while this
             // window remained focused (which does not generate another focus event).
             activateFreeCameraControls();
-        } else if (inputEvent->type == kWindowEventMouseMotion && g_mouseCaptured &&
+        } else if (eventType == kWindowEventMouseMotion && g_mouseCaptured &&
                    event->struct_size >= offsetof(WindowEventCompatibilityView, repeat) +
                        sizeof(bool)) {
             g_input.mouseDeltaX += inputEvent->mouse_delta_x;
@@ -1231,17 +1248,19 @@ void onSceneBegin(ModContext*, const GfxStageContext* stageCtx, void*) {
 }
 
 void onFrameBeforeHud(ModContext*, const GfxStageContext* stageCtx, void*) {
+    const auto* extended =
+        reinterpret_cast<const GfxStageContextInterpolationView*>(stageCtx);
     constexpr size_t kInterpolationStepEnd =
-        offsetof(GfxStageContext, interpolation_step) + sizeof(float);
+        offsetof(GfxStageContextInterpolationView, interpolation_step) + sizeof(float);
     g_presentationStep = stageCtx != nullptr && stageCtx->struct_size >= kInterpolationStepEnd
-        ? std::clamp(stageCtx->interpolation_step, 0.0f, 1.0f)
+        ? std::clamp(extended->interpolation_step, 0.0f, 1.0f)
         : 1.0f;
     constexpr size_t kSimulationTickEnd =
-        offsetof(GfxStageContext, simulation_tick) + sizeof(uint64_t);
+        offsetof(GfxStageContextInterpolationView, simulation_tick) + sizeof(uint64_t);
     g_hasPresentationSimulationTick =
         stageCtx != nullptr && stageCtx->struct_size >= kSimulationTickEnd;
     if (g_hasPresentationSimulationTick) {
-        g_presentationSimulationTick = stageCtx->simulation_tick;
+        g_presentationSimulationTick = extended->simulation_tick;
     }
     renderCamera2();
 }
