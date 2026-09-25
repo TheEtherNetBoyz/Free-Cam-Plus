@@ -962,6 +962,10 @@ void syncMouseCapture() {
     const auto* service = windowServiceCompatibility();
 #if defined(_WIN32)
     if (!windowServiceHasInputEvents() || service->set_relative_mouse_mode == nullptr) {
+        WindowInfo info = WINDOW_INFO_INIT;
+        if (svc_window->get_info(mod_ctx, g_window, &info) == MOD_OK) {
+            g_windowFocused = info.focused;
+        }
         g_mouseCaptured = g_windowFocused && getControlsEnabled();
         return;
     }
