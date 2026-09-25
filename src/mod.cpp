@@ -49,10 +49,15 @@ constexpr float kFastMultiplier = 4.0f;
 constexpr float kAreaBloomStrengthScale = 0.45f;
 constexpr const char* kUpdateRateOptions[] = {
     "Full speed",
+    "120 FPS",
+    "60 FPS",
     "30 FPS",
     "20 FPS",
     "15 FPS",
 };
+constexpr float kShoulderFollowResponse = 120.0f;
+constexpr float kShoulderFollowPrediction = 0.5f;
+constexpr float kShoulderFollowMaxPredictionSpeed = 240.0f;
 
 // WindowService is append-only, but the latest Dusklight main branch still publishes the
 // 1.0 header while newer hosts append input and always-on-top functions. Keep the compatibility
@@ -142,6 +147,9 @@ ConfigVarHandle g_moveSpeed = 0;
 ConfigVarHandle g_fov = 0;
 ConfigVarHandle g_alwaysOnTop = 0;
 ConfigVarHandle g_updateRate = 0;
+ConfigVarHandle g_startOnBoot = 0;
+ConfigVarHandle g_windowX = 0;
+ConfigVarHandle g_windowY = 0;
 ConfigVarHandle g_shoulderFollow = 0;
 ConfigVarHandle g_shoulderDistance = 0;
 ConfigVarHandle g_shoulderSideOffset = 0;
@@ -173,6 +181,10 @@ bool g_windowsEscapeDown = false;
 uint32_t g_stablePlayerModelFrames = 0;
 using CameraClock = std::chrono::steady_clock;
 CameraClock::time_point g_nextCameraRender;
+bool g_bootWindowPending = false;
+bool g_bootWindowAttempted = false;
+CameraClock::time_point g_lastShoulderFollowUpdate;
+bool g_shoulderFollowInitialized = false;
 
 struct InputState {
     bool forward = false;
@@ -371,13 +383,41 @@ void updateShoulderCamera(const daAlink_c* player) {
     const cXyz forward(std::sin(orbitAngle), 0.0f, std::cos(orbitAngle));
     const cXyz right(std::cos(orbitAngle), 0.0f, -std::sin(orbitAngle));
     const cXyz anchor = player->current.pos;
+    const cXyz velocity = player->current.pos - player->old.pos;
+    const float velocityLength = std::sqrt(
+        velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z);
+    const cXyz followAnchor = velocityLength <= kShoulderFollowMaxPredictionSpeed
+        ? anchor + velocity * kShoulderFollowPrediction
+        : anchor;
 
-    g_camera.eye = anchor - (forward * getShoulderDistance()) +
+    const cXyz targetEye = followAnchor - (forward * getShoulderDistance()) +
         (right * getShoulderSideOffset()) + cXyz(0.0f, getShoulderHeight(), 0.0f);
-    g_camera.center = anchor + cXyz(0.0f, getShoulderAimHeight(), 0.0f);
+    const cXyz targetCenter = followAnchor + cXyz(0.0f, getShoulderAimHeight(), 0.0f);
+    const CameraClock::time_point now = CameraClock::now();
+    const float elapsed = g_lastShoulderFollowUpdate.time_since_epoch().count() == 0
+        ? 0.0f
+        : std::chrono::duration<float>(now - g_lastShoulderFollowUpdate).count();
+    const bool snap = !g_shoulderFollowInitialized || elapsed <= 0.0f || elapsed > 0.25f;
+    if (snap) {
+        g_camera.eye = targetEye;
+        g_camera.center = targetCenter;
+    } else {
+        const float alpha = 1.0f - std::exp(-kShoulderFollowResponse *
+            std::min(elapsed, 0.1f));
+        g_camera.eye.x += (targetEye.x - g_camera.eye.x) * alpha;
+        g_camera.eye.y += (targetEye.y - g_camera.eye.y) * alpha;
+        g_camera.eye.z += (targetEye.z - g_camera.eye.z) * alpha;
+        g_camera.center.x += (targetCenter.x - g_camera.center.x) * alpha;
+        g_camera.center.y += (targetCenter.y - g_camera.center.y) * alpha;
+        g_camera.center.z += (targetCenter.z - g_camera.center.z) * alpha;
+    }
+    g_lastShoulderFollowUpdate = now;
+    g_shoulderFollowInitialized = true;
     g_camera.fovy = getFov();
     g_camera.bank = 0;
     g_camera.initialized = true;
+    g_lastShoulderFollowUpdate = CameraClock::time_point{};
+    g_shoulderFollowInitialized = false;
     updateAngles();
 }
 
@@ -455,14 +495,20 @@ float getShoulderAngle() {
 CameraClock::duration getCameraRenderPeriod() {
     int64_t value = 0;
     svc_config->get_int(mod_ctx, g_updateRate, &value);
-    switch (std::clamp<int64_t>(value, 0, 3)) {
+    switch (std::clamp<int64_t>(value, 0, 5)) {
     case 1:
         return std::chrono::duration_cast<CameraClock::duration>(
-            std::chrono::duration<double>(1.0 / 30.0));
+            std::chrono::duration<double>(1.0 / 120.0));
     case 2:
         return std::chrono::duration_cast<CameraClock::duration>(
-            std::chrono::duration<double>(1.0 / 20.0));
+            std::chrono::duration<double>(1.0 / 60.0));
     case 3:
+        return std::chrono::duration_cast<CameraClock::duration>(
+            std::chrono::duration<double>(1.0 / 30.0));
+    case 4:
+        return std::chrono::duration_cast<CameraClock::duration>(
+            std::chrono::duration<double>(1.0 / 20.0));
+    case 5:
         return std::chrono::duration_cast<CameraClock::duration>(
             std::chrono::duration<double>(1.0 / 15.0));
     default:
@@ -577,6 +623,9 @@ void renderCamera2() {
     daAlink_c* player = daAlink_getAlinkActorClass();
     if (getShoulderFollow()) {
         updateShoulderCamera(player);
+    } else {
+        g_lastShoulderFollowUpdate = CameraClock::time_point{};
+        g_shoulderFollowInitialized = false;
     }
 
     Mtx cameraView;
@@ -640,9 +689,22 @@ void renderCamera2() {
     if (svc_gfx->push_present(mod_ctx, g_presentTarget, &payload, sizeof(payload)) == MOD_OK) {
         g_hasRenderedFrame = true;
         const CameraClock::duration period = getCameraRenderPeriod();
-        g_nextCameraRender = period == CameraClock::duration::zero()
-            ? CameraClock::time_point{}
-            : CameraClock::now() + period;
+        if (period == CameraClock::duration::zero()) {
+            g_nextCameraRender = CameraClock::time_point{};
+        } else {
+            const CameraClock::time_point now = CameraClock::now();
+            if (g_nextCameraRender.time_since_epoch().count() == 0 ||
+                now > g_nextCameraRender + period * 8) {
+                g_nextCameraRender = now + period;
+            } else {
+                // Keep the schedule anchored to the requested cadence. Scheduling from
+                // `now` after every frame turns a single late/early hook into a skipped
+                // Camera 2 frame and makes fast follow motion visibly uneven.
+                do {
+                    g_nextCameraRender += period;
+                } while (g_nextCameraRender <= now);
+            }
+        }
     }
 }
 
@@ -782,7 +844,10 @@ void onPresent(ModContext*, const GfxPresentContext* ctx, const void* payload,
     wgpuRenderPassEncoderRelease(pass);
 }
 
+void saveWindowPosition();
+
 ModResult closeWindow() {
+    saveWindowPosition();
     if (g_window != 0 && g_mouseCaptured) {
         const auto* service = windowServiceCompatibility();
         if (windowServiceSupports(kWindowInputMinor,
@@ -1009,6 +1074,40 @@ void syncAlwaysOnTop() {
     }
 }
 
+bool getSavedWindowPosition(int32_t& x, int32_t& y) {
+    int64_t savedX = WINDOW_POSITION_UNDEFINED;
+    int64_t savedY = WINDOW_POSITION_UNDEFINED;
+    if (svc_config->get_int(mod_ctx, g_windowX, &savedX) != MOD_OK ||
+        svc_config->get_int(mod_ctx, g_windowY, &savedY) != MOD_OK ||
+        savedX == WINDOW_POSITION_UNDEFINED || savedY == WINDOW_POSITION_UNDEFINED ||
+        savedX < INT32_MIN || savedX > INT32_MAX || savedY < INT32_MIN || savedY > INT32_MAX) {
+        return false;
+    }
+    x = static_cast<int32_t>(savedX);
+    y = static_cast<int32_t>(savedY);
+    return true;
+}
+
+void saveWindowPosition() {
+    if (g_window == 0 || g_windowX == 0 || g_windowY == 0) {
+        return;
+    }
+
+    WindowInfo info = WINDOW_INFO_INIT;
+    if (svc_window->get_info(mod_ctx, g_window, &info) == MOD_OK &&
+        info.x != WINDOW_POSITION_UNDEFINED && info.y != WINDOW_POSITION_UNDEFINED) {
+        svc_config->set_int(mod_ctx, g_windowX, info.x);
+        svc_config->set_int(mod_ctx, g_windowY, info.y);
+    }
+}
+
+void clearSavedWindowPosition() {
+    if (g_windowX != 0 && g_windowY != 0) {
+        svc_config->set_int(mod_ctx, g_windowX, WINDOW_POSITION_UNDEFINED);
+        svc_config->set_int(mod_ctx, g_windowY, WINDOW_POSITION_UNDEFINED);
+    }
+}
+
 ModResult openWindow() {
     if (g_window != 0) {
         return MOD_CONFLICT;
@@ -1026,6 +1125,12 @@ ModResult openWindow() {
     windowDesc.title = "Freecam+";
     windowDesc.width = kRenderWidth;
     windowDesc.height = kRenderHeight;
+    int32_t savedX = WINDOW_POSITION_UNDEFINED;
+    int32_t savedY = WINDOW_POSITION_UNDEFINED;
+    if (getSavedWindowPosition(savedX, savedY)) {
+        windowDesc.x = savedX;
+        windowDesc.y = savedY;
+    }
     bool alwaysOnTop = false;
     svc_config->get_bool(mod_ctx, g_alwaysOnTop, &alwaysOnTop);
     if (alwaysOnTop) {
@@ -1064,6 +1169,20 @@ void onToggleWindow(ModContext*, void*) {
 
 void onResetView(ModContext*, void*) {
     g_resetViewRequested = true;
+}
+
+void onResetWindowPosition(ModContext*, void*) {
+    const bool wasOpen = g_window != 0;
+    if (wasOpen) {
+        closeWindow();
+    }
+    clearSavedWindowPosition();
+    if (wasOpen) {
+        const ModResult result = openWindow();
+        if (result != MOD_OK) {
+            svc_log->error(mod_ctx, "failed to reopen Freecam+ after resetting window position");
+        }
+    }
 }
 
 void onSceneBegin(ModContext*, const GfxStageContext* stageCtx, void*) {
@@ -1172,6 +1291,13 @@ ModResult buildCameraControls(UiElementHandle pane) {
         "Spawns Freecam+ just above and behind Link once; it remains independent afterward.";
     resetControl.on_pressed = onResetView;
     svc_ui->pane_add_control(mod_ctx, pane, &resetControl, nullptr);
+    UiControlDesc resetWindowPositionControl = UI_CONTROL_DESC_INIT;
+    resetWindowPositionControl.kind = UI_CONTROL_BUTTON;
+    resetWindowPositionControl.label = "Reset Window Position";
+    resetWindowPositionControl.help_rml =
+        "Clears the saved Freecam+ position and returns the window to the host default.";
+    resetWindowPositionControl.on_pressed = onResetWindowPosition;
+    svc_ui->pane_add_control(mod_ctx, pane, &resetWindowPositionControl, nullptr);
     addToggle(pane, "Control Freecam+", g_controls,
         "Freecam+ is an independent free camera. Click its window to capture input. WASD moves, "
         "mouse looks, Space/Ctrl move vertically, Shift speeds up, and Escape releases the mouse.");
@@ -1185,6 +1311,8 @@ ModResult buildCameraControls(UiElementHandle pane) {
         "performance impact while leaving the main game render rate unchanged.");
     addToggle(pane, "Always on Top", g_alwaysOnTop,
         "Keeps the Freecam+ window above other windows and updates while it is open.");
+    addToggle(pane, "Start Freecam+ on Boot", g_startOnBoot,
+        "Opens Freecam+ automatically when Dusklight starts, restoring the last saved settings and window position.");
     addToggle(pane, "Over-the-Shoulder Follow", g_shoulderFollow,
         "Makes Camera 2 follow Link's world position and facing direction without changing the main camera.");
 
@@ -1264,6 +1392,12 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) return result;
     result = registerInt("updateRate", 0, g_updateRate, error);
     if (result != MOD_OK) return result;
+    result = registerBool("startOnBoot", false, g_startOnBoot, error);
+    if (result != MOD_OK) return result;
+    result = registerInt("windowX", WINDOW_POSITION_UNDEFINED, g_windowX, error);
+    if (result != MOD_OK) return result;
+    result = registerInt("windowY", WINDOW_POSITION_UNDEFINED, g_windowY, error);
+    if (result != MOD_OK) return result;
     result = registerBool("alwaysOnTop", false, g_alwaysOnTop, error);
     if (result != MOD_OK) return result;
     result = registerBool("shoulderFollow", false, g_shoulderFollow, error);
@@ -1278,6 +1412,11 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) return result;
     result = registerInt("shoulderAngle", 0, g_shoulderAngle, error);
     if (result != MOD_OK) return result;
+
+    bool startOnBoot = false;
+    svc_config->get_bool(mod_ctx, g_startOnBoot, &startOnBoot);
+    g_bootWindowPending = startOnBoot;
+    g_bootWindowAttempted = false;
 
     GfxStageHookDesc stageDesc = GFX_STAGE_HOOK_DESC_INIT;
     stageDesc.callback = onSceneBegin;
@@ -1307,6 +1446,16 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 }
 
 MOD_EXPORT ModResult mod_update(ModError*) {
+    if (g_bootWindowPending && !g_bootWindowAttempted && g_window == 0) {
+        g_bootWindowAttempted = true;
+        const ModResult result = openWindow();
+        if (result == MOD_OK) {
+            g_bootWindowPending = false;
+        } else {
+            svc_log->error(mod_ctx, "failed to start Freecam+ automatically on boot");
+        }
+    }
+    saveWindowPosition();
     syncAlwaysOnTop();
     syncMouseCapture();
     pollWindowsInput();

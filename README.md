@@ -9,8 +9,9 @@ camera that follows Link's world position.
 
 - Independent free camera in a second window
 - WASD movement, mouse look, vertical movement, and speed boost
-- Camera 2 update rates: full speed, 30 FPS, 20 FPS, or 15 FPS
+- Camera 2 update rates: full speed, 120 FPS, 60 FPS, 30 FPS, 20 FPS, or 15 FPS
 - Optional always-on-top window
+- Optional start-on-boot with persistent Freecam+ settings and window position
 - Optional over-the-shoulder Link follow mode
 - Adjustable distance, side offset, height, aim height, and orbit angle
 - Warp/resource-transition safety guards
@@ -54,7 +55,8 @@ For a full-tree build, add:
 ## Install
 
 Copy `build/mods/secondary_camera.dusk` to Dusklight's `mods` directory and
-restart Dusklight. On macOS, the default directory is:
+restart Dusklight. Freecam+ settings and the auxiliary window position are
+persisted by Dusklight's config service. On macOS, the default directory is:
 
 ```text
 ~/Library/Application Support/TwilitRealm/Dusklight/mods
